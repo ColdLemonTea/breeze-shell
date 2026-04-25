@@ -2,6 +2,7 @@ build
 compile_commands.json
 .xmake
 .cache
+.clice
 build_info.h
 /test
 Xenos.log
