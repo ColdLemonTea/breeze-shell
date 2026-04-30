@@ -11,6 +11,7 @@
 #include "shell/config.h"
 #include "shell/utils.h"
 #include <algorithm>
+#include <chrono>
 #include <fmt/format.h>
 #include <iostream>
 #include <ranges>
@@ -266,11 +267,7 @@ void mb_shell::menu_item_normal_widget::update(ui::update_context &ctx) {
     if (item.disabled) {
         opacity->animate_to(128);
         bg_opacity->animate_to(0);
-
-        if (submenu_wid) {
-            submenu_wid->close();
-            submenu_wid = nullptr;
-        }
+        hide_submenu();
         return;
     } else {
         opacity->animate_to(255);
@@ -304,16 +301,17 @@ void mb_shell::menu_item_normal_widget::update(ui::update_context &ctx) {
                 std::max(show_submenu_timer - ctx.delta_time, 0.f);
         }
 
-        // only act if changed
-        if (show_submenu_timer_before != show_submenu_timer) {
-            if (show_submenu_timer >= 150.f) {
-                show_submenu(ctx);
-            } else {
-                hide_submenu();
-            }
+        if (show_submenu_timer >= 150.f) {
+            show_submenu(ctx);
+        } else if (show_submenu_timer_before != show_submenu_timer) {
+            hide_submenu();
         }
     } else {
         hide_submenu();
+    }
+
+    if (submenu_open_requested && !submenu_wid) {
+        show_submenu(ctx);
     }
 
     if (submenu_wid && submenu_wid->dying_time.has_value) {
@@ -484,7 +482,8 @@ void mb_shell::menu_widget::update(ui::update_context &ctx) {
                     if (wid->item.submenu) {
                         if (!wid->submenu_wid)
                             wid->show_submenu(ctx);
-                        if (!current_submenu->focus_within()) {
+                        if (current_submenu &&
+                            !current_submenu->focus_within()) {
                             if (auto child = current_submenu->get_child<
                                              menu_item_normal_widget>()) {
                                 child->set_focus();
@@ -611,7 +610,9 @@ void mb_shell::menu_widget::update(ui::update_context &ctx) {
                     }
                 } else if (wid && wid->item.submenu && !wid->submenu_wid) {
                     wid->show_submenu(ctx);
-                    current_submenu->set_focus();
+                    if (current_submenu) {
+                        current_submenu->set_focus();
+                    }
                 }
             } else if (menus_matching_key.size() > 1) {
                 move_key(!ctx.key_pressed(GLFW_KEY_LEFT_SHIFT) &&
@@ -1072,6 +1073,7 @@ void mb_shell::menu_item_parent_widget::reset_appear_animation(float delay) {
     opacity->animate_to(255);
 }
 void mb_shell::menu_item_normal_widget::hide_submenu() {
+    submenu_open_requested = false;
     if (submenu_wid != nullptr) {
         submenu_wid->close();
         submenu_wid = nullptr;
@@ -1080,8 +1082,34 @@ void mb_shell::menu_item_normal_widget::hide_submenu() {
 void mb_shell::menu_item_normal_widget::show_submenu(ui::update_context &ctx) {
     if (submenu_wid != nullptr)
         return;
+    submenu_open_requested = true;
+
+    if (item.native_submenu_loader) {
+        if (!native_submenu_future) {
+            native_submenu_future = item.native_submenu_loader.value()();
+            return;
+        }
+
+        if (native_submenu_future->wait_for(std::chrono::milliseconds(0)) !=
+            std::future_status::ready) {
+            return;
+        }
+    }
+
     submenu_wid = std::make_shared<menu_widget>(false);
-    item.submenu.value()(submenu_wid);
+    if (native_submenu_future) {
+        try {
+            submenu_wid->init_from_data(native_submenu_future->get());
+        } catch (std::exception &e) {
+            spdlog::error("Error loading native submenu: {}", e.what());
+            submenu_wid = nullptr;
+            native_submenu_future.reset();
+            return;
+        }
+        native_submenu_future.reset();
+    } else {
+        item.submenu.value()(submenu_wid);
+    }
 
     // We calculate the position of the submenu in
     // the screen space, then convert it to the

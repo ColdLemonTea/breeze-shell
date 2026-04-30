@@ -10,6 +10,7 @@
 #include "shell/widgets/background_widget.h"
 #include <algorithm>
 #include <functional>
+#include <future>
 #include <memory>
 #include <optional>
 
@@ -59,6 +60,8 @@ struct menu_item_normal_widget : public menu_item_widget {
     std::optional<ui::NVGImage> icon_unfold_img{};
 
     std::shared_ptr<menu_widget> submenu_wid = nullptr;
+    std::optional<std::future<menu>> native_submenu_future;
+    bool submenu_open_requested = false;
     float show_submenu_timer = 0.f;
 
     ui::sp_anim_float bg_opacity = anim_float(0, 200);

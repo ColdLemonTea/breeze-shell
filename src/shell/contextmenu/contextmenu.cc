@@ -182,11 +182,23 @@ menu menu::construct_with_hmenu(
         if (info.hSubMenu) {
             auto main_thread_id = GetCurrentThreadId();
             int submenu_pos = i;
+            auto load_submenu = [=]() {
+                return menu::construct_with_hmenu(
+                    info.hSubMenu, hWnd, false, HandleMenuMsg,
+                    MAKELPARAM(static_cast<WORD>(submenu_pos), 0));
+            };
+            item.native_submenu_loader = [=]() mutable {
+                if (main_thread_id == GetCurrentThreadId()) {
+                    std::promise<menu> promise;
+                    promise.set_value(load_submenu());
+                    return promise.get_future();
+                }
+
+                return entry::main_window_loop_hook.add_task(load_submenu);
+            };
             item.submenu = [=](std::shared_ptr<menu_widget> mw) {
                 auto task = [&]() {
-                    mw->init_from_data(menu::construct_with_hmenu(
-                        info.hSubMenu, hWnd, false, HandleMenuMsg,
-                        MAKELPARAM(static_cast<WORD>(submenu_pos), 0)));
+                    mw->init_from_data(load_submenu());
                 };
                 if (main_thread_id == GetCurrentThreadId())
                     task();

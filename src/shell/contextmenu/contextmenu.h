@@ -2,6 +2,7 @@
 
 #include "breeze_ui/nanovg_wrapper.h"
 #include <functional>
+#include <future>
 #include <memory>
 #include <optional>
 #include <string>
@@ -46,6 +47,7 @@ struct menu_item {
     std::optional<std::string> name;
     std::optional<std::function<void()>> action;
     std::optional<std::function<void(std::shared_ptr<menu_widget>)>> submenu;
+    std::optional<std::function<std::future<menu>()>> native_submenu_loader;
     std::optional<size_t> icon_bitmap;
     std::optional<std::string> icon_svg;
     std::optional<std::string> hotkey;
