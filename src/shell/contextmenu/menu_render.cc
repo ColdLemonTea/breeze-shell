@@ -15,6 +15,7 @@
 
 namespace mb_shell {
 std::optional<menu_render *> menu_render::current{};
+std::atomic<ui::render_target *> menu_render::persistent_rt{nullptr};
 menu_render menu_render::create(int x, int y, menu menu, bool run_js) {
     if (auto res = ui::render_target::init_global(); !res) {
         MessageBoxW(NULL, L"Failed to initialize global render target",
@@ -61,6 +62,7 @@ menu_render menu_render::create(int x, int y, menu menu, bool run_js) {
     if (!rt) {
         return {nullptr, std::nullopt};
     }
+    persistent_rt.store(rt.get(), std::memory_order_release);
     auto render = menu_render(rt, std::nullopt);
 
     rt->parent = menu.parent_window;
@@ -74,8 +76,8 @@ menu_render menu_render::create(int x, int y, menu menu, bool run_js) {
     // set the position of the window to fullscreen in this monitor + padding
 
     spdlog::info("Monitor: {} {} {} {}", monitor_info.rcMonitor.left,
-           monitor_info.rcMonitor.top, monitor_info.rcMonitor.right,
-           monitor_info.rcMonitor.bottom);
+                 monitor_info.rcMonitor.top, monitor_info.rcMonitor.right,
+                 monitor_info.rcMonitor.bottom);
 
     rt->set_position(monitor_info.rcMonitor.left + 1,
                      monitor_info.rcMonitor.top + 1);
@@ -96,6 +98,7 @@ menu_render menu_render::create(int x, int y, menu menu, bool run_js) {
         x - monitor_info.rcMonitor.left, y - monitor_info.rcMonitor.top);
     context_menu_hooks::set_active_root_menu_widget(menu_wid->menu_wid);
     rt->root->children.push_back(menu_wid);
+    context_menu_hooks::flush_pending_native_menu_item_updates();
     auto current_js_context =
         entry::main_window_loop_hook
             .add_task([&]() {
@@ -118,9 +121,9 @@ menu_render menu_render::create(int x, int y, menu menu, bool run_js) {
             listener->operator()(menu_info);
         }
         spdlog::info("[perf] JS plugins costed {}ms",
-               std::chrono::duration_cast<std::chrono::milliseconds>(
-                   rt->clock.now() - before_js)
-                   .count());
+                     std::chrono::duration_cast<std::chrono::milliseconds>(
+                         rt->clock.now() - before_js)
+                         .count());
     } else {
         spdlog::info("Skipped running JS");
     }

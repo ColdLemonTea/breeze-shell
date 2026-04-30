@@ -1,6 +1,7 @@
 
 #include "contextmenu.h"
 #include "breeze_ui/ui.h"
+#include "hooks.h"
 #include "menu_widget.h"
 #include "shell/utils.h"
 #include <algorithm>
@@ -17,11 +18,11 @@
 
 #include <consoleapi.h>
 #include <debugapi.h>
+#include <fmt/format.h>
 #include <future>
 #include <iostream>
-#include <spdlog/spdlog.h>
-#include <fmt/format.h>
 #include <ranges>
+#include <spdlog/spdlog.h>
 #include <string>
 #include <thread>
 #include <type_traits>
@@ -137,6 +138,8 @@ menu menu::construct_with_hmenu(
     HMENU hMenu, HWND hWnd, bool is_top,
     std::function<void(int, WPARAM, LPARAM)> HandleMenuMsg,
     LPARAM init_popup_lparam) {
+    context_menu_hooks::track_native_menu_handle(hMenu);
+
     menu m;
 
     if (!HandleMenuMsg)
@@ -155,7 +158,7 @@ menu menu::construct_with_hmenu(
         info.dwTypeData = buffer;
         info.cch = 256;
         if (!GetMenuItemInfoW(hMenu, i, TRUE, &info)) {
-            spdlog::warn( "Failed to get menu item info: %lu", GetLastError());
+            spdlog::warn("Failed to get menu item info: %lu", GetLastError());
             continue;
         }
 
@@ -273,7 +276,8 @@ menu menu::construct_with_hmenu(
                                 item.icon_bitmap = (size_t)result;
                                 if (config::current->context_menu
                                         .search_large_dwItemData_range) {
-                                    spdlog::info("Found icon at offset: {}", offset);
+                                    spdlog::info("Found icon at offset: {}",
+                                                 offset);
                                 }
                                 break;
                             }

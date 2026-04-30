@@ -20,8 +20,11 @@
 #include <shobjidl_core.h>
 #include <spdlog/spdlog.h>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
+#include <vector>
 
 std::atomic_int mb_shell::context_menu_hooks::block_js_reload = 0;
 
@@ -31,9 +34,27 @@ namespace {
 std::atomic<void *> current_live_menu_handle = nullptr;
 std::mutex active_root_menu_mutex;
 std::weak_ptr<mb_shell::menu_widget> active_root_menu;
+std::mutex native_menu_session_mutex;
+std::unordered_set<void *> tracked_native_menu_handles;
+
+struct native_menu_item_state_update {
+    HMENU hMenu = nullptr;
+    UINT item = 0;
+    BOOL fByPosition = FALSE;
+    UINT fMask = 0;
+    UINT fState = 0;
+};
+
+std::vector<native_menu_item_state_update> pending_native_menu_item_updates;
 
 void *current_live_menu() {
     return current_live_menu_handle.load(std::memory_order_relaxed);
+}
+
+bool is_tracked_native_menu_handle(HMENU hMenu) {
+    std::lock_guard lock(native_menu_session_mutex);
+    return tracked_native_menu_handles.find(hMenu) !=
+           tracked_native_menu_handles.end();
 }
 
 std::wstring strip_menu_item_text(std::wstring_view str) {
@@ -232,7 +253,7 @@ bool should_warn_menu_mutation(HMENU hMenu) {
         return false;
     }
 
-    if (current_live_menu() == hMenu) {
+    if (current_live_menu() == hMenu || is_tracked_native_menu_handle(hMenu)) {
         return true;
     }
 
@@ -268,58 +289,91 @@ find_menu_item_widget(const std::shared_ptr<mb_shell::menu_widget> &menu,
     return nullptr;
 }
 
+bool apply_native_menu_item_state_update(
+    const native_menu_item_state_update &update, std::string_view source) {
+    auto root_menu = current_root_menu_widget();
+    if (!root_menu) {
+        spdlog::warn(
+            "{} menu state update could not be applied because the active "
+            "Breeze root menu is not ready (current_menu={}, hMenu={}, "
+            "item={}, by_position={}, fMask=0x{:x})",
+            source, current_live_menu(), (void *)update.hMenu, update.item,
+            (int)update.fByPosition, update.fMask);
+        return false;
+    }
+
+    auto target = find_menu_item_widget(root_menu, update.hMenu, update.item,
+                                        update.fByPosition);
+    if (!target) {
+        spdlog::warn(
+            "{} menu state update could not be mapped to the current Breeze "
+            "menu (current_menu={}, hMenu={}, item={}, by_position={}, "
+            "fMask=0x{:x})",
+            source, current_live_menu(), (void *)update.hMenu, update.item,
+            (int)update.fByPosition, update.fMask);
+        return false;
+    }
+
+    auto disabled = (update.fState & (MFS_DISABLED | MFS_GRAYED)) != 0;
+    spdlog::info(
+        "Applying {} menu state update to Breeze menu (current_menu={}, "
+        "hMenu={}, item={}, by_position={}, fMask=0x{:x}, disabled={})",
+        source, current_live_menu(), (void *)update.hMenu, update.item,
+        (int)update.fByPosition, update.fMask, disabled);
+    target->item.disabled = disabled;
+    return true;
+}
+
+void queue_pending_native_menu_item_update(
+    native_menu_item_state_update update) {
+    std::lock_guard lock(native_menu_session_mutex);
+    pending_native_menu_item_updates.push_back(update);
+}
+
+struct native_menu_session_scope {
+    HMENU hMenu = nullptr;
+    bool owns_session = false;
+
+    explicit native_menu_session_scope(HMENU hMenu, bool owns_session = true)
+        : hMenu(hMenu), owns_session(owns_session) {
+        if (owns_session) {
+            mb_shell::context_menu_hooks::begin_native_menu_session(hMenu);
+        } else {
+            mb_shell::context_menu_hooks::track_native_menu_handle(hMenu);
+        }
+    }
+
+    ~native_menu_session_scope() {
+        if (owns_session) {
+            mb_shell::context_menu_hooks::end_native_menu_session(hMenu);
+        }
+    }
+};
+
 void sync_native_menu_item_update(HMENU hMenu, UINT item, BOOL fByPosition,
                                   LPCMENUITEMINFOW mii) {
-    if (!mii || !should_warn_menu_mutation(hMenu)) {
+    if (!mii || !(mii->fMask & MIIM_STATE) ||
+        !should_warn_menu_mutation(hMenu)) {
         return;
     }
 
-    auto render = mb_shell::menu_render::current;
-    if (!render || !(*render) || !(*render)->rt) {
+    native_menu_item_state_update update{
+        .hMenu = hMenu,
+        .item = item,
+        .fByPosition = fByPosition,
+        .fMask = mii->fMask,
+        .fState = mii->fState,
+    };
+
+    auto rt =
+        mb_shell::menu_render::persistent_rt.load(std::memory_order_acquire);
+    if (!rt) {
+        queue_pending_native_menu_item_update(update);
         return;
     }
 
-    if (!(mii->fMask & MIIM_STATE)) {
-        return;
-    }
-
-    auto copied_info = *mii;
-    (*render)->rt->post_loop_thread_task(
-        [hMenu, item, fByPosition, copied_info]() mutable {
-            auto root_menu = current_root_menu_widget();
-            if (!root_menu) {
-                spdlog::warn(
-                    "Late SetMenuItemInfoW state update could not be applied "
-                    "because the active Breeze root menu is not ready "
-                    "(current_menu={}, hMenu={}, item={}, by_position={}, "
-                    "fMask=0x{:x})",
-                    current_live_menu(), (void *)hMenu, item, (int)fByPosition,
-                    copied_info.fMask);
-                return;
-            }
-
-            auto target =
-                find_menu_item_widget(root_menu, hMenu, item, fByPosition);
-            if (!target) {
-                spdlog::warn(
-                    "Late SetMenuItemInfoW state update could not be mapped to "
-                    "the current Breeze menu (current_menu={}, hMenu={}, "
-                    "item={}, by_position={}, fMask=0x{:x})",
-                    current_live_menu(), (void *)hMenu, item, (int)fByPosition,
-                    copied_info.fMask);
-                return;
-            }
-
-            spdlog::info(
-                "Applying late SetMenuItemInfoW state update to Breeze menu "
-                "(current_menu={}, hMenu={}, item={}, by_position={}, "
-                "fMask=0x{:x}, disabled={})",
-                current_live_menu(), (void *)hMenu, item, (int)fByPosition,
-                copied_info.fMask,
-                (copied_info.fState & (MFS_DISABLED | MFS_GRAYED)) != 0);
-            target->item.disabled =
-                (copied_info.fState & (MFS_DISABLED | MFS_GRAYED)) != 0;
-        },
+    rt->post_loop_thread_task(
+        [update]() { apply_native_menu_item_state_update(update, "late"); },
         true);
 }
 } // namespace
@@ -366,29 +420,65 @@ void mb_shell::context_menu_hooks::clear_active_root_menu_widget(
     }
 }
 
+void mb_shell::context_menu_hooks::begin_native_menu_session(HMENU hMenu) {
+    {
+        std::lock_guard lock(native_menu_session_mutex);
+        tracked_native_menu_handles.clear();
+        pending_native_menu_item_updates.clear();
+        if (hMenu) {
+            tracked_native_menu_handles.insert(hMenu);
+        }
+    }
+
+    clear_active_root_menu_widget();
+    current_live_menu_handle.store(hMenu, std::memory_order_relaxed);
+}
+
+void mb_shell::context_menu_hooks::track_native_menu_handle(HMENU hMenu) {
+    if (!hMenu || !current_live_menu()) {
+        return;
+    }
+
+    std::lock_guard lock(native_menu_session_mutex);
+    tracked_native_menu_handles.insert(hMenu);
+}
+
+void mb_shell::context_menu_hooks::flush_pending_native_menu_item_updates() {
+    std::vector<native_menu_item_state_update> updates;
+    {
+        std::lock_guard lock(native_menu_session_mutex);
+        updates.swap(pending_native_menu_item_updates);
+    }
+
+    for (const auto &update : updates) {
+        apply_native_menu_item_state_update(update, "early");
+    }
+}
+
+void mb_shell::context_menu_hooks::end_native_menu_session(HMENU hMenu) {
+    clear_active_root_menu_widget();
+
+    {
+        std::lock_guard lock(native_menu_session_mutex);
+        tracked_native_menu_handles.clear();
+        pending_native_menu_item_updates.clear();
+    }
+
+    auto expected = static_cast<void *>(hMenu);
+    current_live_menu_handle.compare_exchange_strong(expected, nullptr,
+                                                     std::memory_order_relaxed);
+}
+
 std::optional<int>
 mb_shell::track_popup_menu(mb_shell::menu menu, int x, int y,
                            std::function<void(menu_render &)> on_before_show,
                            bool run_js) {
     auto thread_id_orig = GetCurrentThreadId();
+    native_menu_session_scope fallback_session((HMENU)menu.native_handle,
+                                               !current_live_menu());
     auto selected_menu_future = renderer_thread.add_task([&]() {
         set_thread_name("breeze::renderer_thread");
         try {
-            struct live_menu_guard {
-                explicit live_menu_guard(HMENU hMenu) {
-                    current_live_menu_handle.store(hMenu,
-                                                   std::memory_order_relaxed);
-                    mb_shell::context_menu_hooks::
-                        clear_active_root_menu_widget();
-                }
-                ~live_menu_guard() {
-                    mb_shell::context_menu_hooks::
-                        clear_active_root_menu_widget();
-                    current_live_menu_handle.store(nullptr,
-                                                   std::memory_order_relaxed);
-                }
-            } guard((HMENU)menu.native_handle);
-
             set_thread_name("breeze::context_menu_renderer");
             perf_counter perf("mb_shell::track_popup_menu");
 
@@ -498,6 +588,7 @@ void mb_shell::context_menu_hooks::install_NtUserTrackPopupMenuEx_hook() {
         block_js_reload.fetch_add(1);
 
         perf_counter perf("TrackPopupMenuEx");
+        native_menu_session_scope native_menu_session(hMenu);
         menu menu = menu::construct_with_hmenu(hMenu, hWnd);
         perf.end("construct_with_hmenu");
 
@@ -811,6 +902,7 @@ void mb_shell::context_menu_hooks::install_SHCreateDefaultContextMenu_hook() {
                     entry::main_window_loop_hook.install(hwndOwner);
                     block_js_reload.fetch_add(1);
                     perf_counter perf("TrackPopupMenuEx");
+                    native_menu_session_scope native_menu_session(hmenu);
                     menu menu = menu::construct_with_hmenu(
                         hmenu, hwndOwner, true,
                         [=](int message, WPARAM wParam, LPARAM lParam) {
@@ -842,8 +934,8 @@ void mb_shell::context_menu_hooks::install_SHCreateDefaultContextMenu_hook() {
 }
 
 #pragma optimize("", off)
-extern "C" __declspec(dllexport) size_t
-functionToGetGetUIObjectOfVptr(IShellFolder2 *i) {
+extern "C" __declspec(dllexport)
+size_t functionToGetGetUIObjectOfVptr(IShellFolder2 *i) {
     return i->GetUIObjectOf(nullptr, 0, nullptr, IID_IContextMenu, nullptr,
                             nullptr);
 }
@@ -934,6 +1026,7 @@ HRESULT GetUIObjectOf(
                 entry::main_window_loop_hook.install(hwndOwner);
                 block_js_reload.fetch_add(1);
                 perf_counter perf("TrackPopupMenuEx");
+                native_menu_session_scope native_menu_session(hmenu);
                 menu menu = menu::construct_with_hmenu(
                     hmenu, hwndOwner, true,
                     [=](int message, WPARAM wParam, LPARAM lParam) {

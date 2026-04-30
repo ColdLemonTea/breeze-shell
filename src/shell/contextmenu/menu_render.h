@@ -2,6 +2,7 @@
 #include "breeze_ui/ui.h"
 #include "contextmenu.h"
 #include "shell/utils.h"
+#include <atomic>
 #include <memory>
 #include <optional>
 
@@ -11,6 +12,7 @@ struct menu_render {
     std::optional<int32_t> selected_menu;
     bool light_color = is_light_mode();
     static std::optional<menu_render *> current;
+    static std::atomic<ui::render_target *> persistent_rt;
 
     menu_render() = delete;
     menu_render(std::shared_ptr<ui::render_target> rt,
