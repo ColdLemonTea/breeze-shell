@@ -1072,6 +1072,17 @@ void mb_shell::menu_item_parent_widget::reset_appear_animation(float delay) {
     opacity->reset_to(0);
     opacity->animate_to(255);
 }
+float mb_shell::menu_item_parent_widget::measure_width(
+    ui::update_context &ctx) {
+    float total = 0;
+    float gap = config::current->context_menu.theme.multibutton_line_gap;
+    for (auto &child : children) {
+        total += child->measure_width(ctx);
+    }
+    if (!children.empty())
+        total += gap * (children.size() - 1);
+    return total;
+}
 void mb_shell::menu_item_normal_widget::hide_submenu() {
     submenu_open_requested = false;
     if (submenu_wid != nullptr) {
